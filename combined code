@@ -1,0 +1,361 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+
+// ------------------- WIFI SETUP -------------------
+const char* ssid = "ESP32-Bridge";
+const char* password = "12345678";
+
+
+WebServer server(80);
+
+
+// ------------------- MOTOR CONTROL -------------------
+int in1 = 26;
+int in2 = 27;
+int enA = 25;
+
+
+bool bridgeOpen = false;
+bool bridgeUp   = false;
+bool haltActive = false;   // NEW: emergency stop flag
+
+
+// ------------------- SENSORS -------------------
+const int trigPin  = 23;
+const int echoPin  = 22;
+const int trigPin2 = 21;
+const int echoPin2 = 17;
+
+
+long duration, duration2;
+float distance = 1000;
+float distance2 = 1000;
+
+
+// ------------------- BUTTONS -------------------
+const int topButton = 32;
+const int bottomButton = 33;
+
+
+// ------------------- LEDS -------------------
+const int roadLED = 18;
+const int bridgeLED = 19;
+
+
+bool firstOrSecond;
+bool passed = false;
+
+
+// ------------------- FUNCTION DECLARATIONS -------------------
+void handleRoot();
+void handleOpen();
+void handleClose();
+void handleHalt();
+void handleResetHalt();
+void openBridge();
+void closeBridge();
+void ultra1();
+void ultra2();
+void spinForward();
+void spinBackward();
+void stopMotor();
+
+
+// ------------------- WEBPAGE HANDLER -------------------
+void handleRoot() {
+ String html = "<!DOCTYPE html><html><head>";
+ html += "<meta http-equiv='refresh' content='1'>";
+ html += "<title>ESP32 Bridge Control</title>";
+ html += "<style>body{font-family:sans-serif;text-align:center;background:#f2f2f2;}";
+ html += "button{font-size:20px;padding:10px 25px;margin:10px;border:none;border-radius:10px;cursor:pointer;}";
+ html += "button:disabled{opacity:0.5;cursor:not-allowed;}</style>";
+ html += "</head><body>";
+ html += "<h1>🚧 ESP32 Bridge Control Panel 🚧</h1>";
+
+
+ // Emergency Halt status
+ if (haltActive) {
+   html += "<h2 style='color:red;'>⚠️ SYSTEM HALTED ⚠️</h2>";
+ }
+
+
+ // Bridge status
+ html += "<h2>Bridge Status:</h2>";
+ html += bridgeOpen ? "<p style='color:orange;font-size:22px;'>OPENING / OPEN ✅</p>" : "<p style='color:green;font-size:22px;'>CLOSED ✅</p>";
+
+
+ // Bridge position
+ html += "<h2>Bridge Position:</h2>";
+ html += bridgeUp ? "<p style='color:blue;font-size:22px;'>UP ⬆️</p>" : "<p style='color:brown;font-size:22px;'>DOWN ⬇️</p>";
+
+
+ // Sensors
+ html += "<h2>Sensor Readings:</h2>";
+ html += "<p>Sensor 1: " + String(distance) + " cm</p>";
+ html += "<p>Sensor 2: " + String(distance2) + " cm</p>";
+
+
+ // Buttons
+ html += "<h2>Limit Switches:</h2>";
+ html += (digitalRead(topButton) == LOW) ? "<p>Top Button: PRESSED 🟢</p>" : "<p>Top Button: NOT PRESSED 🔴</p>";
+ html += (digitalRead(bottomButton) == LOW) ? "<p>Bottom Button: PRESSED 🟢</p>" : "<p>Bottom Button: NOT PRESSED 🔴</p>";
+
+
+ // Manual Controls
+ html += "<h2>Manual Override</h2>";
+
+
+ // Disable open/close buttons if halted
+ String disableAttr = haltActive ? "disabled" : "";
+
+
+ html += "<button style='background:#007bff;color:white;' " + disableAttr +
+         " onclick=\"if(confirm('⚠️ Are you sure you want to OPEN the bridge?')) location.href='/openBridge';\">Open Bridge</button>";
+ html += "<button style='background:#dc3545;color:white;' " + disableAttr +
+         " onclick=\"if(confirm('⚠️ Are you sure you want to CLOSE the bridge?')) location.href='/closeBridge';\">Close Bridge</button>";
+
+
+ // Emergency Stop + Reset buttons
+ html += "<h2>Emergency Controls</h2>";
+ html += "<button style='background:#ff0000;color:white;' onclick=\"if(confirm('🚨 HALT all operations immediately?')) location.href='/halt';\">HALT ALL</button>";
+ html += "<button style='background:#28a745;color:white;' onclick=\"if(confirm('✅ Reset halt and resume control?')) location.href='/resetHalt';\">Reset Halt</button>";
+
+
+ html += "</body></html>";
+ server.send(200, "text/html", html);
+}
+
+
+// Handle manual open
+void handleOpen() {
+ if (!haltActive) {
+   Serial.println("Manual command: OPEN BRIDGE");
+   openBridge();
+ }
+ server.sendHeader("Location", "/");
+ server.send(303);
+}
+
+
+// Handle manual close
+void handleClose() {
+ if (!haltActive) {
+   Serial.println("Manual command: CLOSE BRIDGE");
+   closeBridge();
+ }
+ server.sendHeader("Location", "/");
+ server.send(303);
+}
+
+
+// Handle emergency halt
+void handleHalt() {
+ Serial.println("🚨 EMERGENCY HALT ACTIVATED 🚨");
+ stopMotor();
+ haltActive = true;
+ bridgeOpen = false; // Freeze logic
+ server.sendHeader("Location", "/");
+ server.send(303);
+}
+
+
+// Handle reset of halt
+void handleResetHalt() {
+ Serial.println("✅ Halt Reset. System resumed.");
+ haltActive = false;
+ server.sendHeader("Location", "/");
+ server.send(303);
+}
+
+
+// ------------------- SETUP -------------------
+void setup() {
+ Serial.begin(115200);
+
+
+ pinMode(in1, OUTPUT);
+ pinMode(in2, OUTPUT);
+ pinMode(enA, OUTPUT);
+
+
+ pinMode(roadLED, OUTPUT);
+ pinMode(bridgeLED, OUTPUT);
+
+
+ pinMode(trigPin, OUTPUT);
+ pinMode(echoPin, INPUT);
+ pinMode(trigPin2, OUTPUT);
+ pinMode(echoPin2, INPUT);
+
+
+ pinMode(topButton, INPUT_PULLUP);
+ pinMode(bottomButton, INPUT_PULLUP);
+
+
+ digitalWrite(roadLED, LOW);
+ digitalWrite(bridgeLED, HIGH);
+
+
+ // Start Access Point
+ WiFi.softAP(ssid, password);
+ Serial.println("Access Point Started!");
+ Serial.print("Connect to: "); Serial.println(ssid);
+ Serial.print("IP Address: "); Serial.println(WiFi.softAPIP());
+
+
+ // Web routes
+ server.on("/", handleRoot);
+ server.on("/openBridge", handleOpen);
+ server.on("/closeBridge", handleClose);
+ server.on("/halt", handleHalt);
+ server.on("/resetHalt", handleResetHalt);
+
+
+ server.begin();
+ Serial.println("HTTP server started");
+}
+
+
+// ------------------- MAIN LOOP -------------------
+void loop() {
+ server.handleClient(); // Handle web connections
+
+
+ ultra1();
+ ultra2();
+
+
+ if (haltActive) {
+   stopMotor(); // stop everything during halt
+   return;
+ }
+
+
+ // --- Automatic Logic ---
+ if (!bridgeOpen) {
+   if (distance < 2) {
+     firstOrSecond = true;
+     openBridge();
+   }
+   if (distance2 < 2) {
+     firstOrSecond = false;
+     openBridge();
+   }
+ }
+
+
+ if (bridgeOpen) {
+   if (firstOrSecond && distance2 < 2) closeBridge();
+   if (!firstOrSecond && distance < 2) closeBridge();
+ }
+}
+
+
+// ------------------- BRIDGE FUNCTIONS -------------------
+void openBridge() {
+ if (bridgeOpen || haltActive) return;
+ bridgeOpen = true;
+
+
+ for (int i = 0; i < 5; i++) {
+   if (haltActive) return stopMotor();
+   digitalWrite(roadLED, LOW);
+   delay(100);
+   digitalWrite(roadLED, HIGH);
+   delay(100);
+ }
+
+
+ Serial.println("Stopping Cars...");
+ digitalWrite(roadLED, HIGH);
+
+
+ Serial.println("Opening Bridge");
+ spinForward();
+
+
+ while (!bridgeUp && !haltActive) {
+   if (digitalRead(topButton) == LOW) {
+     bridgeUp = true;
+     stopMotor();
+     Serial.println("Bridge UP - Motor stopped");
+   }
+ }
+
+
+ stopMotor();
+ digitalWrite(bridgeLED, LOW);
+}
+
+
+void closeBridge() {
+ if (!bridgeOpen || haltActive) return;
+ Serial.println("Closing Bridge...");
+ digitalWrite(bridgeLED, HIGH);
+ spinBackward();
+
+
+ while (bridgeUp && !haltActive) {
+   if (digitalRead(bottomButton) == LOW) {
+     bridgeUp = false;
+     stopMotor();
+     Serial.println("Bridge DOWN - Motor stopped");
+   }
+ }
+
+
+ stopMotor();
+ digitalWrite(roadLED, LOW);
+ bridgeOpen = false;
+ passed = false;
+}
+
+
+// ------------------- MOTOR + SENSOR FUNCTIONS -------------------
+void spinForward() {
+ digitalWrite(in1, HIGH);
+ digitalWrite(in2, LOW);
+ digitalWrite(enA, HIGH);
+}
+
+
+void spinBackward() {
+ digitalWrite(in1, LOW);
+ digitalWrite(in2, HIGH);
+ digitalWrite(enA, HIGH);
+}
+
+
+void stopMotor() {
+ digitalWrite(in1, LOW);
+ digitalWrite(in2, LOW);
+ digitalWrite(enA, LOW);
+}
+
+
+void ultra1() {
+ digitalWrite(trigPin, LOW);
+ delayMicroseconds(2);
+ digitalWrite(trigPin, HIGH);
+ delayMicroseconds(10);
+ digitalWrite(trigPin, LOW);
+ duration = pulseIn(echoPin, HIGH, 30000);
+ if (duration > 0) distance = duration * 0.034 / 2;
+}
+
+
+void ultra2() {
+ digitalWrite(trigPin2, LOW);
+ delayMicroseconds(2);
+ digitalWrite(trigPin2, HIGH);
+ delayMicroseconds(10);
+ digitalWrite(trigPin2, LOW);
+ duration2 = pulseIn(echoPin2, HIGH, 30000);
+ if (duration2 > 0) distance2 = duration2 * 0.034 / 2;
+}
+
+
+
+
+
